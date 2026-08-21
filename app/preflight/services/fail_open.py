@@ -1,32 +1,40 @@
 """Fail-open wrapper: the single most important safety property of Preflight.
 
-If the engine can't produce a decision within the configured budget, or
-throws for any reason, we ALWAYS fall back to existing routing. Customer
-traffic must never be blocked or broken by this module.
+If the decision can't be produced within the configured budget, or throws
+for any reason, we ALWAYS fall back to existing routing. Customer traffic
+must never be blocked or broken by this module.
+
+Callers pass in the *coroutine* that produces the decision (not an
+already-built PreflightEngine) so that everything needed to reach a
+decision — including acquiring a DB connection — runs inside this
+function's try/except. A DB connection acquired earlier, e.g. via a
+FastAPI `Depends()`, resolves BEFORE the route handler body runs, which
+means a failure there (Postgres unreachable, etc.) would never reach this
+wrapper and would surface as a raw, unhandled 500 instead of a clean
+fallback_existing_route decision. See router.py's `run_preflight_decision`
+for the coroutine this is meant to wrap.
 """
 
 import asyncio
 import logging
 import traceback
 import uuid
+from typing import Awaitable
 
 from app.preflight.core.config import settings
-from app.preflight.schemas.api_models import PreflightDecision, PreflightRequest
-from app.preflight.services.preflight_engine import PreflightEngine
+from app.preflight.schemas.api_models import PreflightDecision
 
 logger = logging.getLogger("supervea.preflight")
 
 
 async def safe_decide_with_timeout(
-    engine: PreflightEngine,
-    request: PreflightRequest,
-    mode: str,
+    decision: Awaitable[PreflightDecision],
     timeout_ms: int | None = None,
 ) -> PreflightDecision:
     budget_ms = timeout_ms or settings.decision_timeout_ms
     try:
         return await asyncio.wait_for(
-            engine.decide(request, mode=mode),  # type: ignore[arg-type]
+            decision,
             timeout=budget_ms / 1000.0,
         )
     except asyncio.TimeoutError:

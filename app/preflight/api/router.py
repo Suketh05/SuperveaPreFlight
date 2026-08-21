@@ -6,14 +6,13 @@ into internally — see app/preflight/integration_example.py.
 """
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.preflight.api.dependencies import build_preflight_engine, get_db_connection, get_tenant_id
+from app.preflight.api.dependencies import get_db_connection, get_tenant_id, run_preflight_decision
 from app.preflight.core.config import settings
 from app.preflight.persistence import queries
 from app.preflight.schemas.api_models import ObservationIn, PreflightDecision, PreflightRequest
 from app.preflight.services.fail_open import safe_decide_with_timeout
-from app.preflight.services.preflight_engine import PreflightEngine
 
 router = APIRouter(prefix="/api/v1", tags=["preflight"])
 
@@ -21,11 +20,11 @@ router = APIRouter(prefix="/api/v1", tags=["preflight"])
 @router.post("/preflight", response_model=PreflightDecision)
 async def preflight_route(
     body: PreflightRequest,
+    request: Request,
     tenant_id: str = Depends(get_tenant_id),
-    engine: PreflightEngine = Depends(build_preflight_engine),
 ) -> PreflightDecision:
     body.tenant_id = tenant_id
-    return await safe_decide_with_timeout(engine, body, mode=settings.mode)
+    return await safe_decide_with_timeout(run_preflight_decision(request, body, settings.mode))
 
 
 @router.post("/observations", status_code=202)

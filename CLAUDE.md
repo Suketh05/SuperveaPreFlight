@@ -287,6 +287,66 @@ DB-write layer (the normalizer), so a single malformed record from any
 external API — OpenRouter today, Kong/LiteLLM later — can never take down
 an entire sync.
 
+## RESOLVED BUG #6 — Postgres outage bypassed fail-open, returned raw 500
+
+**Symptom:** found while live-testing the exact scenario `MENTOR_GUIDE.md`'s
+Example 5 describes (stop Postgres mid-flight, confirm the request still
+gets a clean `fallback_existing_route` decision). It didn't — the request
+came back as a bare `Internal Server Error` with no JSON body at all, not
+even the fail-open shape.
+
+**Root cause:** `services/fail_open.py::safe_decide_with_timeout()` only
+wrapped the call to `engine.decide()` in its try/except. But the DB
+connection wasn't acquired inside that call — it was acquired earlier, by
+FastAPI's dependency chain (`Depends(build_preflight_engine)` →
+`Depends(get_db_connection)` → `pool.acquire()` in
+`api/dependencies.py`). FastAPI resolves `Depends()` params **before**
+the route handler body runs, so when Postgres was down, `pool.acquire()`
+raised `ConnectionRefusedError` during dependency resolution — a point
+the fail-open wrapper never got a chance to see. FastAPI's default
+unhandled-exception behavior is a bare 500, so the single most important
+guarantee in this repo (fail-open, always) was silently not being
+enforced for the one failure mode it exists to catch: the database
+disappearing.
+
+**Fix applied:** moved DB connection acquisition inside the same
+try/except boundary as the decision itself, instead of resolving it as a
+separate FastAPI dependency ahead of time.
+- `services/fail_open.py` — `safe_decide_with_timeout()` no longer takes
+  a pre-built `PreflightEngine`. It now takes the *coroutine* that
+  produces the `PreflightDecision` (connection acquisition included) and
+  awaits it inside `asyncio.wait_for(...)`, so a connection failure hits
+  the exact same `except Exception` fallback as any other engine failure.
+- `api/dependencies.py` — new `run_preflight_decision(request, body,
+  mode)` acquires the pool connection, builds the engine, and calls
+  `decide()`, all in one coroutine — meant to be passed into
+  `safe_decide_with_timeout()`, not called directly via `Depends()`.
+  `build_preflight_engine()`/`get_db_connection()` are unchanged and
+  still used as-is by `POST /api/v1/observations`, which doesn't carry
+  the fail-open guarantee (see Session 2 notes on that endpoint).
+- `api/router.py` — `/preflight` now calls
+  `safe_decide_with_timeout(run_preflight_decision(request, body,
+  settings.mode))` instead of resolving the engine via `Depends()`.
+- `integration_example.py` — updated to match (illustrative-only file,
+  but kept consistent since it's the checked-in template for wiring this
+  into a real endpoint).
+
+**Verified live** (not just unit tests): started Postgres, confirmed the
+happy path (`"decision":"route"`); stopped Postgres mid-flight
+(`brew services stop postgresql@15`) and re-ran the same curl —
+`HTTP/1.1 200 OK`, `"decision":"fallback_existing_route"`, `"reason":
+"Preflight failed (ConnectionRefusedError); using existing configured
+route."`; confirmed the traceback still prints to the server log
+(`[preflight] EXCEPTION in engine.decide()`); restarted Postgres and
+re-ran the full `pytest -v` suite (still 47 passed).
+
+**Lesson worth preserving (same theme as bugs #1-#3):** a `try/except`
+around "the interesting part" isn't enough if something upstream of it —
+like FastAPI's own `Depends()` resolution — can fail first and outside
+that boundary. For a fail-open guarantee to actually hold, everything
+that could plausibly fail (including connection setup, not just business
+logic) needs to run *inside* the safety wrapper, not alongside it.
+
 ## No other known active bugs
 
 If you hit a new issue, document it in this file in the same format:

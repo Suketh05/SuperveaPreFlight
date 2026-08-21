@@ -19,7 +19,7 @@ and CLAUDE.md's Session 2 notes for why).
 
 import logging
 
-from app.preflight.api.dependencies import build_preflight_engine
+from app.preflight.api.dependencies import run_preflight_decision
 from app.preflight.core.config import settings
 from app.preflight.schemas.api_models import PreflightRequest
 from app.preflight.services.fail_open import safe_decide_with_timeout
@@ -27,12 +27,21 @@ from app.preflight.services.fail_open import safe_decide_with_timeout
 logger = logging.getLogger("supervea.preflight.integration_example")
 
 
-async def chat_completions_with_preflight(request, tenant_id: str, existing_app):
+async def chat_completions_with_preflight(request, tenant_id: str, existing_app, fastapi_request):
     """
-    `request`      = your existing ChatCompletionRequest object
-    `existing_app`  = wherever execute_without_preflight /
-                       execute_with_selected_route / _map_request_to_constraints /
-                       _lookup_policy_profile_id already live in your codebase
+    `request`         = your existing ChatCompletionRequest object
+    `existing_app`     = wherever execute_without_preflight /
+                          execute_with_selected_route / _map_request_to_constraints /
+                          _lookup_policy_profile_id already live in your codebase
+    `fastapi_request`  = the `Request` your endpoint already receives —
+                          needed so run_preflight_decision can reach
+                          `app.state.preflight_db_pool` / `.preflight_redis_client`
+                          itself, INSIDE the fail-open try/except below,
+                          instead of a Depends() acquiring the connection
+                          before this function ever runs (see fail_open.py's
+                          docstring — that ordering is what let a Postgres
+                          outage surface as a raw 500 instead of a clean
+                          fallback_existing_route decision).
     """
     model = request.model or "auto"
 
@@ -47,8 +56,9 @@ async def chat_completions_with_preflight(request, tenant_id: str, existing_app)
         policy_profile_id=existing_app.lookup_policy_profile_id(tenant_id),
     )
 
-    engine = await build_preflight_engine()  # in practice: resolved via Depends
-    decision = await safe_decide_with_timeout(engine, preflight_request, mode=settings.mode)
+    decision = await safe_decide_with_timeout(
+        run_preflight_decision(fastapi_request, preflight_request, settings.mode)
+    )
 
     if decision.decision == "fallback_existing_route":
         return await existing_app.execute_without_preflight(request, tenant_id)
