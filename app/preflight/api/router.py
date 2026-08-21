@@ -5,11 +5,13 @@ and is also what the existing OpenAI-compatible endpoint wiring calls
 into internally — see app/preflight/integration_example.py.
 """
 
-from fastapi import APIRouter, Depends
+import asyncpg
+from fastapi import APIRouter, Depends, HTTPException
 
-from app.preflight.api.dependencies import build_preflight_engine, get_tenant_id
+from app.preflight.api.dependencies import build_preflight_engine, get_db_connection, get_tenant_id
 from app.preflight.core.config import settings
-from app.preflight.schemas.api_models import PreflightDecision, PreflightRequest
+from app.preflight.persistence import queries
+from app.preflight.schemas.api_models import ObservationIn, PreflightDecision, PreflightRequest
 from app.preflight.services.fail_open import safe_decide_with_timeout
 from app.preflight.services.preflight_engine import PreflightEngine
 
@@ -24,3 +26,16 @@ async def preflight_route(
 ) -> PreflightDecision:
     body.tenant_id = tenant_id
     return await safe_decide_with_timeout(engine, body, mode=settings.mode)
+
+
+@router.post("/observations", status_code=202)
+async def record_observation(
+    body: ObservationIn,
+    tenant_id: str = Depends(get_tenant_id),
+    db: asyncpg.Connection = Depends(get_db_connection),
+) -> dict:
+    try:
+        await queries.record_observation(db, body.route_id, tenant_id, body)
+    except ValueError as exc:
+        raise HTTPException(422, f"Invalid route_id: {exc}")
+    return {"status": "recorded"}

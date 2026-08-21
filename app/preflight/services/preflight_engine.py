@@ -70,6 +70,7 @@ class PreflightEngine:
 
         candidates: list[CandidateRoute] = rejected.copy()
         enriched: list[tuple[dict, CandidateRoute]] = []
+        health_by_route_id: dict[str, dict] = {}
 
         for route in eligible:
             pricing = await self.redis.get_json(f"route:pricing:{route['route_id']}")
@@ -83,6 +84,7 @@ class PreflightEngine:
             else:
                 cost = self.cost_estimator.estimate_cost_usd(route, input_tokens, output_tokens)
             health = await self.redis.get_json(f"route:health:{route['route_id']}") or {}
+            health_by_route_id[str(route["route_id"])] = health
             latency_ms = health.get("latency_p95_ms") or route.get("advertised_latency_p95") or 1000
 
             candidate = CandidateRoute(
@@ -115,7 +117,9 @@ class PreflightEngine:
             model=selected_route["model"],
             estimated_cost_usd=selected_candidate.estimated_cost_usd,
             estimated_latency_ms=selected_candidate.estimated_latency_ms,
-            confidence=self._estimate_confidence(selected_route),
+            confidence=self._estimate_confidence(
+                selected_route, health_by_route_id.get(str(selected_route["route_id"]), {})
+            ),
             candidates=candidates,
             reason=(
                 "Lowest estimated cost among healthy, policy-compliant routes "
@@ -159,9 +163,12 @@ class PreflightEngine:
             return False
         return True
 
-    def _estimate_confidence(self, route: dict) -> float:
-        # MVP: flat confidence for fresh, healthy routes. Refine using
-        # route_intelligence (success rates, observation volume) later.
+    def _estimate_confidence(self, route: dict, health: dict) -> float:
+        # Prefer real confidence from route_intelligence (built from actual
+        # observed outcomes — see workers/intelligence_rollup.py). Only
+        # fall back to the flat heuristic when no observations exist yet.
+        if health.get("confidence") is not None:
+            return float(health["confidence"])
         return 0.8 if route.get("data_freshness") == "fresh" else 0.4
 
     async def _no_route_decision(

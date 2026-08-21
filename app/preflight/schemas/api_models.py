@@ -4,7 +4,7 @@ These are the models exchanged over HTTP at POST /api/v1/preflight and
 consumed internally by the existing OpenAI-compatible endpoint wiring.
 """
 
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -59,3 +59,25 @@ class PreflightDecision(BaseModel):
     candidates: List[CandidateRoute]
     reason: str
     decision_latency_ms: float
+
+
+class ObservationIn(BaseModel):
+    """A single real-execution outcome, reported AFTER a request was executed.
+
+    Preflight itself never executes requests — it only recommends a
+    route_id (see integration_example.py). This is its only source of
+    real telemetry: whatever layer actually calls the model is expected
+    to report back what really happened (latency, success/failure, actual
+    cost) via POST /api/v1/observations, so route_intelligence can be
+    built from real outcomes instead of guesses.
+    """
+
+    route_id: str
+    latency_ms: Optional[int] = Field(default=None, ge=0)
+    status_code: Optional[int] = None
+    success: bool
+    input_tokens: Optional[int] = Field(default=None, ge=0)
+    output_tokens: Optional[int] = Field(default=None, ge=0)
+    estimated_cost_usd: Optional[float] = Field(default=None, ge=0)
+    actual_cost_usd: Optional[float] = Field(default=None, ge=0)
+    metadata: Optional[Dict[str, Any]] = None

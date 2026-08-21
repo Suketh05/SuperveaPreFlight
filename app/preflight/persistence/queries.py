@@ -5,12 +5,14 @@ testable without a live database (mock these functions in unit tests).
 """
 
 import json
+import uuid
+from datetime import datetime, timezone
 
 import asyncpg
 
 from app.preflight.core.config import settings
 from app.preflight.core.redis_cache import RedisCache
-from app.preflight.schemas.api_models import PreflightConstraints
+from app.preflight.schemas.api_models import ObservationIn, PreflightConstraints
 from app.preflight.schemas.internal_models import RequestProfile
 
 LOAD_POLICY_SQL = """
@@ -76,6 +78,101 @@ async def load_policy(
     return constraints
 
 
+RECORD_OBSERVATION_SQL = """
+INSERT INTO public.route_observations (
+    route_id, tenant_id, timestamp, latency_ms, status_code, success,
+    input_tokens, output_tokens, estimated_cost_usd, actual_cost_usd, metadata
+) VALUES ($1, $2, now(), $3, $4, $5, $6, $7, $8, $9, $10);
+"""
+
+# One row per route_id with any observation in the last 24h. Windowed
+# rates (5m/1h/24h) are computed with FILTER rather than separate
+# queries so a single scan of the last 24h of observations produces the
+# whole rollup for that route.
+AGGREGATE_OBSERVATIONS_SQL = """
+SELECT
+    route_id,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)
+        FILTER (WHERE latency_ms IS NOT NULL) AS latency_p50_ms,
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)
+        FILTER (WHERE latency_ms IS NOT NULL) AS latency_p95_ms,
+    avg(CASE WHEN success THEN 1.0 ELSE 0.0 END)
+        FILTER (WHERE timestamp >= now() - interval '5 minutes') AS success_rate_5m,
+    avg(CASE WHEN success THEN 1.0 ELSE 0.0 END)
+        FILTER (WHERE timestamp >= now() - interval '1 hour') AS success_rate_1h,
+    avg(CASE WHEN success THEN 1.0 ELSE 0.0 END)
+        FILTER (WHERE timestamp >= now() - interval '24 hours') AS success_rate_24h,
+    avg(CASE WHEN NOT success THEN 1.0 ELSE 0.0 END)
+        FILTER (WHERE timestamp >= now() - interval '5 minutes') AS error_rate_5m,
+    avg(estimated_cost_usd)
+        FILTER (WHERE timestamp >= now() - interval '24 hours') AS observed_cost_per_request,
+    count(*)
+        FILTER (WHERE timestamp >= now() - interval '24 hours') AS observation_count_24h
+FROM public.route_observations
+WHERE timestamp >= now() - interval '24 hours'
+GROUP BY route_id;
+"""
+
+UPSERT_ROUTE_INTELLIGENCE_SQL = """
+INSERT INTO public.route_intelligence (
+    route_id, observed_cost_per_1k_tokens, latency_p50_ms, latency_p95_ms,
+    success_rate_5m, success_rate_1h, success_rate_24h, error_rate_5m,
+    availability, confidence, last_updated
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (route_id) DO UPDATE SET
+    observed_cost_per_1k_tokens = EXCLUDED.observed_cost_per_1k_tokens,
+    latency_p50_ms               = EXCLUDED.latency_p50_ms,
+    latency_p95_ms                = EXCLUDED.latency_p95_ms,
+    success_rate_5m               = EXCLUDED.success_rate_5m,
+    success_rate_1h               = EXCLUDED.success_rate_1h,
+    success_rate_24h              = EXCLUDED.success_rate_24h,
+    error_rate_5m                 = EXCLUDED.error_rate_5m,
+    availability                  = EXCLUDED.availability,
+    confidence                    = EXCLUDED.confidence,
+    last_updated                  = EXCLUDED.last_updated;
+"""
+
+
+async def record_observation(
+    db: asyncpg.Connection, route_id: str, tenant_id: str | None, obs: ObservationIn
+) -> None:
+    await db.execute(
+        RECORD_OBSERVATION_SQL,
+        uuid.UUID(route_id),
+        tenant_id,
+        obs.latency_ms,
+        obs.status_code,
+        obs.success,
+        obs.input_tokens,
+        obs.output_tokens,
+        obs.estimated_cost_usd,
+        obs.actual_cost_usd,
+        json.dumps(obs.metadata) if obs.metadata is not None else None,
+    )
+
+
+async def fetch_observation_aggregates(db: asyncpg.Connection) -> list[dict]:
+    rows = await db.fetch(AGGREGATE_OBSERVATIONS_SQL)
+    return [dict(row) for row in rows]
+
+
+async def upsert_route_intelligence(db: asyncpg.Connection, route_id: str, health: dict) -> None:
+    await db.execute(
+        UPSERT_ROUTE_INTELLIGENCE_SQL,
+        uuid.UUID(route_id),
+        health.get("observed_cost_per_1k_tokens"),
+        health.get("latency_p50_ms"),
+        health.get("latency_p95_ms"),
+        health.get("success_rate_5m"),
+        health.get("success_rate_1h"),
+        health.get("success_rate_24h"),
+        health.get("error_rate_5m"),
+        health.get("availability"),
+        health.get("confidence"),
+        datetime.now(timezone.utc),
+    )
+
+
 async def load_candidate_routes(db: asyncpg.Connection, profile: RequestProfile) -> list[dict]:
     rows = await db.fetch(LOAD_CANDIDATE_ROUTES_SQL, profile.requested_model)
     return [dict(row) for row in rows]
@@ -92,8 +189,6 @@ async def persist_decision(
     reason: str,
     decision_latency_ms: float,
 ) -> None:
-    import uuid
-
     await db.execute(
         INSERT_DECISION_SQL,
         uuid.uuid4(),

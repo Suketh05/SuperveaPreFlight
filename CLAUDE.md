@@ -451,3 +451,94 @@ that looks like it's using stale pricing, check whether the pricing
 cache's TTL (1 hour default) has outlived the actual Postgres price (e.g.
 after a manual `UPDATE routes ...`), since a manual DB edit does not
 invalidate the cache — only a fresh adapter sync does.
+
+### Built an observation -> intelligence rollup, made confidence real
+
+`route_intelligence` existed as a table since the initial migration but
+nothing ever wrote to it, and `PreflightEngine._estimate_confidence()`
+was a flat `0.8` (fresh) / `0.4` (stale) guess. Fixed by building the
+actual pipeline the table was designed for: real execution outcomes come
+in via a new `POST /api/v1/observations` endpoint, get rolled up on a
+cadence into `route_intelligence` + a Redis health cache, and the engine
+reads that cache to compute a real confidence score.
+
+**New file `workers/intelligence_rollup.py`** — this is a ROLLUP of
+`route_observations`, deliberately **not** a live per-route health
+prober that goes and pings routes on a timer. Three reasons, worth
+re-reading if you're ever tempted to "upgrade" this to active probing:
+1. OpenRouter alone exposes 30+ chat routes — live-pinging all of them
+   every 15-30s is wasted load on someone else's API for a signal real
+   traffic already gives us for free the moment something reports an
+   observation.
+2. A synthetic "is it up" ping doesn't capture what actually matters —
+   real chat-completion latency/success under real prompt sizes and
+   load. A route can ace a 1-token ping and still choke on a 4k-token
+   completion.
+3. The "no live gateway calls in the request path" rule is about the
+   *data plane* (the `/api/v1/preflight` endpoint itself), not the
+   control plane — this module runs on the same footing as
+   `route_normalizer.py`'s adapter syncs. So skipping active probing is
+   a deliberate cost/quality tradeoff, not something forced by that
+   rule.
+
+`compute_route_health(agg_row)` is a pure function (zero I/O, easily
+unit-tested — see `tests/test_intelligence_rollup.py`) that turns one
+row of `queries.fetch_observation_aggregates()` (windowed 5m/1h/24h
+success rates, p50/p95 latency, observed cost, and a 24h observation
+count, computed in Postgres via `FILTER (WHERE ...)` clauses so it's one
+scan of `route_observations`) into a health dict. Two scores come out of
+it, and they mean different things:
+- `availability` / `health_score` describe *how good the route looks
+  right now* — availability prefers the tightest window with data (5m,
+  falling back to 1h, then 24h, then defaulting to 1.0 for a route with
+  zero observations, since an unobserved route shouldn't be punished for
+  silence), and `health_score` further discounts that by the current 5m
+  error rate.
+- `confidence` describes *how much we trust that number*, separately
+  from how good it looks — it's `availability` scaled by
+  `min(1.0, observation_count_24h / FULL_CONFIDENCE_OBSERVATIONS)`
+  (`FULL_CONFIDENCE_OBSERVATIONS = 50`), so a route with 2 perfect
+  observations scores low confidence even though its availability is
+  1.0. This is what the engine now reads.
+
+`run_intelligence_rollup_once()` wraps each route's upsert-and-cache work
+in its own `try/except` — one bad route (bad data, a transient DB error)
+must never abort the rollup for every other route, same defense-in-depth
+principle as `route_normalizer.py`'s per-route error handling
+(RESOLVED BUG #3 above). The Redis health cache key is
+`route:health:<route_id>` with no TTL (`ttl_seconds=None`) — the rollup
+loop itself (`run_intelligence_rollup_loop`, default `interval_seconds=20`)
+is what keeps it fresh, not Redis expiry.
+
+**New endpoint `POST /api/v1/observations`** (`api/router.py`) — takes
+the new `ObservationIn` schema (`schemas/api_models.py`) and calls
+`queries.record_observation()`, which inserts into
+`route_observations`. This is Preflight's *only* source of real
+telemetry: Preflight never executes requests itself (see the two
+non-negotiable design properties at the top of this file), so it has no
+other way to know whether a route actually worked. `queries.py` gained
+`record_observation`, `fetch_observation_aggregates`, and
+`upsert_route_intelligence` alongside their SQL constants, following the
+existing "all raw SQL lives in `persistence/queries.py`" convention.
+
+**Engine change (`services/preflight_engine.py`):**
+`_estimate_confidence(route, health)` now takes the health dict for the
+route it's scoring and returns `health["confidence"]` when present,
+falling back to the old flat 0.8/0.4 heuristic only when no observations
+exist yet for that route. `decide()` already looked up
+`route:health:<route_id>` per candidate for latency — that same dict is
+now stashed in a `health_by_route_id` map so it can be reused for the
+winning route's confidence without a second Redis round-trip.
+
+**Honest caveat:** `route_intelligence` and `route:health:*` stay
+completely empty — and the engine keeps using the flat 0.8/0.4 heuristic
+— until something actually calls `POST /api/v1/observations` with real
+outcomes. Nothing in this repo does that yet. `integration_example.py`
+shows (commented out, since that file is illustrative-only) where the
+call belongs: right after the existing optimizer/executor actually runs
+the selected route, wrapped in a try/except that swallows and logs any
+failure so telemetry reporting can never affect the customer's response.
+Wiring that call for real is the existing (separate) optimization
+layer's job, outside this repo — until that happens,
+`run_intelligence_rollup_once` will run and log `Intelligence rollup
+updated 0 routes` every cycle, which is expected, not a bug.
