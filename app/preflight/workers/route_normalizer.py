@@ -14,10 +14,13 @@ avoids one bad row poisoning an otherwise-successful sync.
 
 import traceback
 from datetime import datetime, timezone
+from typing import Optional
 
 import asyncpg
 
 from app.preflight.adapters.base import GatewayAdapter
+from app.preflight.core.config import settings
+from app.preflight.core.redis_cache import RedisCache
 from app.preflight.schemas.internal_models import DiscoveredRoute
 
 UPSERT_ROUTE_SQL = """
@@ -47,7 +50,8 @@ DO UPDATE SET
     status                    = EXCLUDED.status,
     data_freshness            = 'fresh',
     last_successful_sync      = EXCLUDED.last_successful_sync,
-    last_updated               = now();
+    last_updated               = now()
+RETURNING route_id;
 """
 
 MARK_STALE_SQL = """
@@ -58,8 +62,9 @@ WHERE gateway_id = $1;
 
 
 class RouteNormalizer:
-    def __init__(self, db: asyncpg.Connection):
+    def __init__(self, db: asyncpg.Connection, redis_cache: Optional[RedisCache] = None):
         self.db = db
+        self.redis_cache = redis_cache
 
     async def sync_gateway_routes(self, gateway_row: dict, adapter: GatewayAdapter) -> int:
         """Sync one gateway's routes. Returns the number of routes upserted."""
@@ -108,7 +113,7 @@ class RouteNormalizer:
         )
         now = datetime.now(timezone.utc)
 
-        await self.db.execute(
+        route_id = await self.db.fetchval(
             UPSERT_ROUTE_SQL,
             gateway_row["gateway_id"],
             discovered.provider,
@@ -127,6 +132,19 @@ class RouteNormalizer:
             discovered.status,
             now,
         )
+
+        if self.redis_cache is not None and route_id is not None:
+            await self.redis_cache.set_json(
+                f"route:pricing:{route_id}",
+                {
+                    "input_price_per_1m": discovered.input_price_per_1m,
+                    "output_price_per_1m": discovered.output_price_per_1m,
+                    "currency": discovered.currency,
+                    "last_updated": now.isoformat(),
+                    "staleness": "fresh",
+                },
+                ttl_seconds=settings.pricing_cache_ttl_seconds,
+            )
 
     async def _mark_gateway_routes_stale(self, gateway_id: str) -> None:
         await self.db.execute(MARK_STALE_SQL, gateway_id)

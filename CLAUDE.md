@@ -370,3 +370,84 @@ pytest -v
 - The "only mark stale on total failure" logic in `route_normalizer.py`
   (RESOLVED BUG #2 above) — don't revert to blanket-staling on any
   exception, that was the bug.
+
+## Session 2
+
+Wired up the two Redis caches (`route:pricing:<route_id>` and
+`policy:profile:<id>`) that were described in the original blueprint but,
+per the "Not built yet" section above, were never actually connected —
+every decision was reading policy and price straight from Postgres on
+every request. This was fine at MVP request volume in local testing, but
+defeats the purpose of having a data plane that's supposed to avoid
+hitting Postgres on the hot path for data that changes rarely (policy
+profiles) or on a slow adapter cadence (pricing).
+
+**Config (`core/config.py`):** added `policy_cache_ttl_seconds` (env
+`SUPERVEA_PREFLIGHT_POLICY_CACHE_TTL`, default 300s) and
+`pricing_cache_ttl_seconds` (env `SUPERVEA_PREFLIGHT_PRICING_CACHE_TTL`,
+default 3600s), following the same `os.getenv` pattern as
+`decision_cache_ttl_seconds`. Two separate TTLs because the two caches
+have very different natural staleness windows — policy profiles are
+edited rarely and correctness-sensitive, pricing changes on the adapter
+sync cadence (1-6 hours per the scheduler docstring).
+
+**Policy cache (`persistence/queries.py::load_policy`):** now takes an
+optional `redis_cache` param. On a cache hit it returns
+`PreflightConstraints(**cached)` without ever touching Postgres. On a
+miss (or when `redis_cache` is `None`, e.g. tests that don't wire Redis),
+it falls through to the existing `db.fetchrow` logic unchanged, then
+populates the cache before returning. The `if not policy_profile_id`
+short-circuit stays first and skips both Redis and Postgres — no policy
+profile means no lookup needed either way. `PreflightEngine.decide()` now
+passes `self.redis` into this call.
+
+**Pricing cache (`workers/route_normalizer.py` +
+`services/preflight_engine.py`):** the pricing side is populated as a
+side effect of the *existing* sync path rather than a separate cache-fill
+step, since pricing only ever changes when an adapter sync writes it.
+`UPSERT_ROUTE_SQL` now ends in `RETURNING route_id` and `_upsert_route`
+uses `fetchval` instead of `execute` so it has the route's UUID (needed
+whether the row was an insert or an on-conflict update) to key the cache
+entry. `RouteNormalizer` takes an optional `redis_cache` — when present,
+every successful upsert also writes `route:pricing:<route_id>` with the
+price, currency, and a fresh timestamp. On the read side,
+`PreflightEngine.decide()` checks `route:pricing:<route_id>` before
+costing each eligible route; on a hit it builds a `priced_route` dict
+(the Postgres row with just the two price fields overridden) and costs
+that instead. **Postgres stays canonical** — a cache miss (cold cache,
+TTL expired, or bootstrap run before this change) just falls back to the
+price already loaded on the route row from `load_candidate_routes`, so
+this is a pure latency optimization, not a new source of truth.
+
+**Threading `redis_cache` through the scheduler and bootstrap script:**
+`run_catalogue_sync_once` and `run_catalogue_sync_loop` in
+`workers/scheduler.py` both gained an optional `redis_cache: RedisCache |
+None = None` param that's passed straight into `RouteNormalizer(conn,
+redis_cache=redis_cache)`. It defaults to `None` specifically so any
+existing caller that doesn't know about this yet keeps working exactly
+as before (cache simply doesn't get populated on that path, no error).
+`scripts/bootstrap_openrouter.py` now builds a `Redis`/`RedisCache` pair
+using the same pattern as `init_preflight_connections` in
+`api/lifespan.py`, and passes it into `run_catalogue_sync_once` so a
+fresh bootstrap run also warms the pricing cache — previously it only
+ever populated Postgres, so the pricing cache stayed empty until the
+first scheduled sync ran (or forever, in a dev setup that never starts
+the scheduler).
+
+**Tests:** `app/preflight/tests/test_policy_cache.py` uses in-memory fake
+`db`/`redis_cache` objects with call counters (no real Postgres/Redis) to
+prove `load_policy` is genuinely cache-through: a second call with the
+same `policy_profile_id` does not call `fetchrow` again, a cache miss
+populates the cache with the exact dict `PreflightConstraints(**cached)`
+can reconstruct from, `redis_cache=None` falls through to the DB every
+call (no caching, no crash), and the empty-`policy_profile_id`
+short-circuit never touches either the DB or Redis.
+
+**What this does NOT change:** the pricing cache is intentionally
+best-effort and read-only from the engine's perspective — nothing in
+`preflight_engine.py` ever writes to `route:pricing:*`, only
+`route_normalizer.py` does, during a sync. If you're debugging a decision
+that looks like it's using stale pricing, check whether the pricing
+cache's TTL (1 hour default) has outlived the actual Postgres price (e.g.
+after a manual `UPDATE routes ...`), since a manual DB edit does not
+invalidate the cache — only a fresh adapter sync does.

@@ -32,5 +32,11 @@ class PreflightSettings:
     # Decision cache TTL (seconds)
     decision_cache_ttl_seconds: int = int(os.getenv("SUPERVEA_PREFLIGHT_DECISION_CACHE_TTL", "120"))
 
+    # Policy cache TTL (seconds)
+    policy_cache_ttl_seconds: int = int(os.getenv("SUPERVEA_PREFLIGHT_POLICY_CACHE_TTL", "300"))
+
+    # Pricing cache TTL (seconds)
+    pricing_cache_ttl_seconds: int = int(os.getenv("SUPERVEA_PREFLIGHT_PRICING_CACHE_TTL", "3600"))
+
 
 settings = PreflightSettings()

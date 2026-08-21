@@ -58,7 +58,7 @@ class PreflightEngine:
         if cached:
             return PreflightDecision(**cached)
 
-        policy = await queries.load_policy(self.db, profile.policy_profile_id)
+        policy = await queries.load_policy(self.db, profile.policy_profile_id, self.redis)
         candidate_routes = await queries.load_candidate_routes(self.db, profile)
 
         eligible, rejected = await self.route_filter.hard_filter(profile, candidate_routes, policy)
@@ -72,7 +72,16 @@ class PreflightEngine:
         enriched: list[tuple[dict, CandidateRoute]] = []
 
         for route in eligible:
-            cost = self.cost_estimator.estimate_cost_usd(route, input_tokens, output_tokens)
+            pricing = await self.redis.get_json(f"route:pricing:{route['route_id']}")
+            if pricing is not None:
+                priced_route = {
+                    **route,
+                    "input_price_per_1m": pricing["input_price_per_1m"],
+                    "output_price_per_1m": pricing["output_price_per_1m"],
+                }
+                cost = self.cost_estimator.estimate_cost_usd(priced_route, input_tokens, output_tokens)
+            else:
+                cost = self.cost_estimator.estimate_cost_usd(route, input_tokens, output_tokens)
             health = await self.redis.get_json(f"route:health:{route['route_id']}") or {}
             latency_ms = health.get("latency_p95_ms") or route.get("advertised_latency_p95") or 1000
 

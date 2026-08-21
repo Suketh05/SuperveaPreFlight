@@ -8,6 +8,8 @@ import json
 
 import asyncpg
 
+from app.preflight.core.config import settings
+from app.preflight.core.redis_cache import RedisCache
 from app.preflight.schemas.api_models import PreflightConstraints
 from app.preflight.schemas.internal_models import RequestProfile
 
@@ -38,15 +40,25 @@ INSERT INTO public.preflight_decisions (
 """
 
 
-async def load_policy(db: asyncpg.Connection, policy_profile_id: str | None) -> PreflightConstraints:
+async def load_policy(
+    db: asyncpg.Connection,
+    policy_profile_id: str | None,
+    redis_cache: RedisCache | None = None,
+) -> PreflightConstraints:
     if not policy_profile_id:
         return PreflightConstraints()
+
+    cache_key = f"policy:profile:{policy_profile_id}"
+    if redis_cache is not None:
+        cached = await redis_cache.get_json(cache_key)
+        if cached is not None:
+            return PreflightConstraints(**cached)
 
     row = await db.fetchrow(LOAD_POLICY_SQL, policy_profile_id)
     if not row:
         return PreflightConstraints()
 
-    return PreflightConstraints(
+    constraints = PreflightConstraints(
         allowed_providers=row["allowed_providers"],
         allowed_models=row["allowed_models"],
         allowed_regions=row["allowed_regions"],
@@ -55,6 +67,13 @@ async def load_policy(db: asyncpg.Connection, policy_profile_id: str | None) -> 
         required_capabilities=row["required_capabilities"],
         data_classification=row["data_classification"],
     )
+
+    if redis_cache is not None:
+        await redis_cache.set_json(
+            cache_key, constraints.model_dump(), ttl_seconds=settings.policy_cache_ttl_seconds
+        )
+
+    return constraints
 
 
 async def load_candidate_routes(db: asyncpg.Connection, profile: RequestProfile) -> list[dict]:
