@@ -15,6 +15,13 @@ from app.preflight.core.redis_cache import RedisCache
 from app.preflight.schemas.api_models import ObservationIn, PreflightConstraints
 from app.preflight.schemas.internal_models import RequestProfile
 
+LOAD_ACTIVE_GATEWAYS_SQL = """
+SELECT gateway_id, tenant_id, name, type, endpoint, environment, region,
+       status, adapter_version
+FROM public.gateways
+WHERE status != 'disabled';
+"""
+
 LOAD_POLICY_SQL = """
 SELECT allowed_providers, allowed_models, allowed_regions,
        max_cost_usd, max_latency_ms, required_capabilities, data_classification
@@ -40,6 +47,11 @@ INSERT INTO public.preflight_decisions (
     decision_type, candidates, reason, decision_latency_ms
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
 """
+
+
+async def load_active_gateways(db: asyncpg.Connection) -> list[dict]:
+    rows = await db.fetch(LOAD_ACTIVE_GATEWAYS_SQL)
+    return [dict(row) for row in rows]
 
 
 async def load_policy(

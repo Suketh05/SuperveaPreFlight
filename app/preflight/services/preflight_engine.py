@@ -72,8 +72,16 @@ class PreflightEngine:
         enriched: list[tuple[dict, CandidateRoute]] = []
         health_by_route_id: dict[str, dict] = {}
 
+        # Batch the per-route Redis lookups into two MGETs instead of up to
+        # 2 round trips PER route — with 20-30+ eligible routes and a 10ms
+        # fail-open budget, sequential GETs here is a real latency risk.
+        route_ids = [str(r["route_id"]) for r in eligible]
+        pricing_map = await self.redis.get_json_many([f"route:pricing:{rid}" for rid in route_ids])
+        health_map = await self.redis.get_json_many([f"route:health:{rid}" for rid in route_ids])
+
         for route in eligible:
-            pricing = await self.redis.get_json(f"route:pricing:{route['route_id']}")
+            route_id = str(route["route_id"])
+            pricing = pricing_map.get(f"route:pricing:{route_id}")
             if pricing is not None:
                 priced_route = {
                     **route,
@@ -83,12 +91,12 @@ class PreflightEngine:
                 cost = self.cost_estimator.estimate_cost_usd(priced_route, input_tokens, output_tokens)
             else:
                 cost = self.cost_estimator.estimate_cost_usd(route, input_tokens, output_tokens)
-            health = await self.redis.get_json(f"route:health:{route['route_id']}") or {}
-            health_by_route_id[str(route["route_id"])] = health
+            health = health_map.get(f"route:health:{route_id}") or {}
+            health_by_route_id[route_id] = health
             latency_ms = health.get("latency_p95_ms") or route.get("advertised_latency_p95") or 1000
 
             candidate = CandidateRoute(
-                route_id=str(route["route_id"]),
+                route_id=route_id,
                 estimated_cost_usd=cost,
                 estimated_latency_ms=int(latency_ms),
                 status="eligible",

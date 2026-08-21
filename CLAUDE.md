@@ -542,3 +542,69 @@ Wiring that call for real is the existing (separate) optimization
 layer's job, outside this repo — until that happens,
 `run_intelligence_rollup_once` will run and log `Intelligence rollup
 updated 0 routes` every cycle, which is expected, not a bug.
+
+### Batched the per-route Redis reads, and actually started the background jobs
+
+Two problems surfaced once pricing + health lookups were both landed:
+`decide()` was doing up to 2 sequential Redis round trips (`route:pricing:*`,
+`route:health:*`) for EVERY eligible route inside its `for route in
+eligible:` loop. With OpenRouter alone exposing 30+ chat routes, that's
+40-60+ sequential `GET`s against a `decision_timeout_ms` fail-open budget
+of 10ms — each round trip only needs to add sub-millisecond latency for
+that budget to blow, and the failure mode is silent: you just get more
+`fallback_existing_route` decisions with `"reason": "Preflight failed"`,
+which looks exactly like RESOLVED BUG #1 all over again if you don't
+know to look at Redis round-trip count. Separately, `run_catalogue_sync_loop`
+(`workers/scheduler.py`) and `run_intelligence_rollup_loop`
+(`workers/intelligence_rollup.py`) were fully implemented but nothing
+ever called them outside of `bootstrap_openrouter.py`'s one-shot sync —
+so in a real running app, routes would never re-sync after the initial
+bootstrap and `route_intelligence` would never update past whatever a
+manual script run produced.
+
+**Batching (`core/redis_cache.py` + `services/preflight_engine.py`):**
+added `RedisCache.get_json_many(keys)`, which prefixes every key and
+calls `MGET` once instead of `GET` per key, returning a dict keyed by
+the *unprefixed* keys the caller passed in (same ergonomics as
+`get_json`, callers never think about `<env>:` prefixing). `decide()`
+now builds `pricing_map` and `health_map` with two `get_json_many()`
+calls total — right before the per-route loop, not inside it — instead
+of two `get_json()` calls per route. Empty `keys` short-circuits to `{}`
+without touching Redis at all (relevant for the `_no_route_decision`
+path, which never reaches this code anyway, but keeps the method safe
+to call with zero eligible routes too). This turns O(routes) round trips
+into a constant 2, regardless of how many candidate routes a request has.
+
+**Actually starting the background jobs (`api/lifespan.py`):**
+`init_preflight_connections` now, after creating the db pool and Redis
+client: loads active gateway rows (`queries.load_active_gateways`, new
+`LOAD_ACTIVE_GATEWAYS_SQL` — `status != 'disabled'`), builds a
+`RedisCache`, and starts both `run_catalogue_sync_loop` and
+`run_intelligence_rollup_loop` as `asyncio.create_task(...)`, storing
+both tasks in `app.state.preflight_background_tasks`. This whole block
+is wrapped in a `try/except` that logs a warning (with `exc_info=True` —
+same "never swallow silently" practice as `fail_open.py` and
+`route_normalizer.py`) and falls back to `app.state.preflight_background_tasks
+= []` on failure, rather than crashing app startup — a fresh environment
+where the migration hasn't been applied yet, or `bootstrap_openrouter.py`
+hasn't been run yet, should still boot fine and just serve
+`no_route_found` decisions from an empty registry, not crash-loop.
+`close_preflight_connections` now cancels every task in
+`app.state.preflight_background_tasks` (and awaits each one, swallowing
+the expected `asyncio.CancelledError`) *before* closing the db pool and
+Redis client — so a task doesn't get caught mid-query against a pool
+that's already closing.
+
+**`scripts/bootstrap_openrouter.py` is intentionally unaffected** — it
+still builds its own pool/Redis/`RouteNormalizer` by hand and calls
+`run_catalogue_sync_once` directly, independent of `lifespan.py`. That's
+by design: it's meant to be runnable once, standalone, before the app
+(and therefore `lifespan.py`) has ever started, to seed the first batch
+of routes.
+
+**Tests:** `tests/test_redis_cache_batching.py` uses a fake Redis client
+with only an async `mget(keys)` method backed by an in-memory dict and a
+call counter — asserts fetching 3 keys (2 present, 1 missing) returns
+the right dict keyed by the original unprefixed keys with `None` for the
+miss, and that `mget` was called exactly once; and asserts an empty key
+list makes zero calls.

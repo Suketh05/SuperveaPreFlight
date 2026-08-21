@@ -25,6 +25,21 @@ class RedisCache:
             return None
         return json.loads(raw)
 
+    async def get_json_many(self, keys: list[str]) -> dict[str, Optional[dict]]:
+        """Fetches several keys in ONE round trip via MGET instead of one
+        GET per key. Keyed by the UNPREFIXED keys passed in — callers
+        shouldn't need to know about env-prefixing.
+        """
+        if not keys:
+            return {}
+
+        prefixed = [self._key(k) for k in keys]
+        raw_values = await self.client.mget(prefixed)
+        return {
+            key: (json.loads(raw) if raw is not None else None)
+            for key, raw in zip(keys, raw_values)
+        }
+
     async def set_json(self, key: str, value: dict, ttl_seconds: Optional[int] = None) -> None:
         raw = json.dumps(value, separators=(",", ":"), default=str)
         if ttl_seconds:
