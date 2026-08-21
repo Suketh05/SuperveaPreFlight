@@ -17,6 +17,7 @@ import logging
 import asyncpg
 
 from app.preflight.adapters.base import GatewayAdapter
+from app.preflight.adapters.litellm_adapter import LiteLLMAdapter
 from app.preflight.adapters.openrouter_adapter import OpenRouterAdapter
 from app.preflight.core.config import settings
 from app.preflight.core.redis_cache import RedisCache
@@ -28,6 +29,7 @@ logger = logging.getLogger("supervea.preflight.scheduler")
 # rows from the `gateways` table instead of hard-coding.
 ADAPTER_REGISTRY: dict[str, type[GatewayAdapter]] = {
     "openrouter": OpenRouterAdapter,
+    "litellm": LiteLLMAdapter,
 }
 
 

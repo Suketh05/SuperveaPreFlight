@@ -55,10 +55,12 @@ app/preflight/
 │   └── redis_cache.py      # env-prefixed Redis wrapper
 ├── adapters/
 │   ├── base.py               # GatewayAdapter ABC — the interface every adapter implements
-│   └── openrouter_adapter.py  # real OpenRouter /models API call + mapping logic
+│   ├── openrouter_adapter.py  # real OpenRouter /models API call + mapping logic
+│   └── litellm_adapter.py     # real LiteLLM public model/pricing catalog + mapping logic
 ├── workers/
 │   ├── route_normalizer.py  # upserts adapter output into Postgres `routes` table
-│   └── scheduler.py         # runs adapter syncs on a cadence (background loop)
+│   ├── scheduler.py         # runs adapter syncs on a cadence (background loop)
+│   └── intelligence_rollup.py  # rolls up route_observations into route_intelligence + Redis health
 ├── persistence/
 │   └── queries.py           # ALL raw SQL lives here (load_policy, load_candidate_routes, persist_decision)
 ├── services/
@@ -76,6 +78,7 @@ app/preflight/
 app/main.py                   # standalone runnable test harness — NOT for production
 migrations/001_preflight_schema.sql  # Postgres schema (6 tables)
 scripts/bootstrap_openrouter.py       # one-time: insert OpenRouter gateway row + first sync
+scripts/bootstrap_litellm.py          # one-time: insert LiteLLM gateway row + first sync
 ```
 
 ## Current status — what's built vs. not
@@ -97,8 +100,8 @@ against a real Postgres + Redis + OpenRouter API):
 - Unit tests for filter logic, estimators, OpenRouter mapping
 
 **Not built yet (known gaps, not bugs):**
-- Kong adapter, LiteLLM adapter (same `GatewayAdapter` interface, would be
-  a copy of `openrouter_adapter.py`)
+- Kong adapter (same `GatewayAdapter` interface — LiteLLM's adapter,
+  added in Session 3, is the template to copy)
 - The Redis pricing cache (`<env>:route:pricing:<route_id>`) and policy
   cache (`<env>:policy:profile:<id>`) described in the original blueprint
   are NOT wired up — `CostEstimator` reads price straight from the Postgres
@@ -727,3 +730,133 @@ Full `pytest -v` suite: 26 passed, 0 skipped, no live Postgres/Redis
 required for any of them (all are pure-function or fake-collaborator
 unit tests). `python3 -m py_compile` across all of `app/` and `scripts/`:
 zero syntax errors.
+
+## Session 3 — LiteLLM adapter (second real gateway)
+
+Added `adapters/litellm_adapter.py`, a second `GatewayAdapter`
+implementation, closing part of the "Not built yet" gap noted at the top
+of this file (Kong is still not built — deliberately out of scope for
+this session).
+
+**Why this is real data, not a mock:** LiteLLM doesn't need a live proxy
+deployment to get real routes from — it publishes its entire
+model/pricing catalog as a static, public, no-auth JSON file in its own
+GitHub repo:
+`https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json`.
+That's the same file every LiteLLM proxy instance ships bundled with.
+Fetching it is a real HTTP call against real, current, third-party data
+— not hand-written fixtures — so once LiteLLM's routes sit in the same
+`routes` table as OpenRouter's, the engine's cross-gateway cost
+comparison is proving something genuine, not just exercising code paths
+against one data source.
+
+**Verified against the live catalog before writing the mapper** (per
+the task's instruction not to assume the shape) — fetched the real file
+and inspected it with a throwaway script rather than trusting the
+assumed shape:
+- 3,111 top-level keys. `mode` values found in the wild: `chat` (2,380),
+  `image_generation` (215), `embedding` (132), `responses` (89),
+  `audio_transcription` (66), `completion` (36), `audio_speech` (31),
+  `image_edit` (31), `realtime` (29), `rerank` (25), `video_generation`
+  (25), `search` (20), `ocr` (14), `None`/missing (9), `moderation` (6),
+  `guardrail` (1), `vector_store` (1) — considerably more non-chat
+  modes mixed into one flat file than the task description enumerated,
+  which only strengthens the case for the `mode in ("chat",
+  "completion")` filter being load-bearing, not optional. This is the
+  same class of problem already documented in **RESOLVED BUG #3** above
+  (a non-chat OpenRouter model with non-token pricing sailing through
+  unfiltered and overflowing the `numeric(12,6)` price column) —
+  LiteLLM's catalog just mixes far more non-chat modes into one file
+  than OpenRouter's `/models` response does, so the same filter matters
+  even more here.
+- `sample_spec` is confirmed real and present — a documentation-template
+  entry whose field values are description *strings* (e.g. `"mode": "one
+  of: chat, embedding, completion, ..."`), not real model data. It would
+  already fail the mode filter, but the mapper checks the literal key
+  first for a clearer skip reason.
+- 503 of 3,111 entries are missing `input_cost_per_token` and/or
+  `output_cost_per_token` entirely (confirmed via `.get()`, not
+  indexing) — real incomplete/placeholder rows, not a hypothetical.
+- **The `MAX_REASONABLE_PRICE_PER_1M` sanity cap is not just defensive
+  copy-paste from OpenRouter's adapter — it's necessary.** 5 real
+  entries in the live catalog (all under the `wandb/` provider prefix,
+  e.g. `wandb/deepseek-ai/DeepSeek-R1-0528` at 135,000/1M input and
+  540,000/1M output) genuinely exceed the 100,000-per-1M cap after
+  conversion. Confirmed bad upstream data, not a hypothetical edge case.
+- `litellm_provider` was present on every chat/completion entry checked
+  (0 missing) — the `.get("litellm_provider", "unknown")` fallback in
+  the mapper is defensive-only in practice, not covering an observed gap.
+- `supports_function_calling` was present on only 1,685 of 2,416
+  chat/completion entries (~70%) — confirms the `.get(...)` (not
+  indexing) is required, not optional, for that field.
+- Ran the mapper against the full real 3,111-entry catalog end-to-end
+  (not just the unit tests' small fixtures) as a final live smoke test:
+  **2,295 routes mapped successfully, 816 skipped (non-chat modality,
+  missing cost fields, or implausible price), zero crashes.**
+
+**`map_litellm_model_to_supervea(model_key, model_obj)`** — standalone,
+pure, unit-testable function (mirrors `map_openrouter_model_to_supervea`'s
+shape exactly): skips `sample_spec` by name, skips anything whose `mode`
+isn't `"chat"` or `"completion"`, skips entries missing either cost
+field, applies the same `MAX_REASONABLE_PRICE_PER_1M` cap OpenRouter's
+mapper uses, builds `provider = litellm_provider` and `model =
+"{provider}:{model_key}"` (same `provider:model` convention as
+OpenRouter, so both gateways' routes are comparable/joinable in the DB
+by model string), converts cost-per-token to cost-per-1M with the same
+rounding convention as `_to_per_million()` (a local copy, not a
+cross-file import, to keep each adapter file self-contained), and adds
+`"tool_use"` / `"long_context"` capabilities the same way OpenRouter's
+mapper does (`supports_function_calling` / `max_input_tokens >=
+128_000`). `region="global"`, `data_regions=["US", "EU"]` — LiteLLM's
+catalog doesn't specify regions, so these match OpenRouter's same
+defaults for consistency.
+
+**`LiteLLMAdapter(GatewayAdapter)`** — `discover_routes()` fetches the
+catalog once via `httpx`, iterates its top-level items, and wraps each
+`map_litellm_model_to_supervea()` call in the exact same `(KeyError,
+ValueError, TypeError)` per-entry `try/except` as
+`OpenRouterAdapter.discover_routes()` — one bad/non-chat/implausible
+entry is skipped and logged, never aborts the sync (same defense-in-depth
+principle as RESOLVED BUG #3's fix). `get_health()` does a cheap
+low-timeout re-fetch of the catalog, same `httpx.HTTPError` pattern as
+OpenRouter's. `get_usage`/`get_pricing`/`get_metadata` are `{}` MVP
+stubs, same as OpenRouter's. `gateway_config` only needs `catalog_url`
+(defaults to the GitHub raw URL, `DEFAULT_CATALOG_URL`) and `timeout_s`.
+
+**Wiring:** `workers/scheduler.py`'s `ADAPTER_REGISTRY` gained
+`"litellm": LiteLLMAdapter` alongside the existing `"openrouter"` entry
+— no other change to `scheduler.py` was needed, since
+`run_catalogue_sync_once()`'s generic adapter-construction path already
+works for LiteLLM (it just ignores the OpenRouter-specific
+`api_key`/`base_url` config keys it's handed and falls back to
+`DEFAULT_CATALOG_URL`).
+
+**New `scripts/bootstrap_litellm.py`** — an exact mirror of
+`bootstrap_openrouter.py`'s structure (same `FIND_GATEWAY_SQL` /
+`INSERT_GATEWAY_SQL` pattern, same existing-row check before inserting,
+same pool/Redis/`RouteNormalizer` wiring via
+`run_catalogue_sync_once(..., redis_cache=redis_cache)`), inserting a
+gateway row with `name="LiteLLM"`, `type="litellm"`, `endpoint=
+DEFAULT_CATALOG_URL`. `bootstrap_openrouter.py` itself was **not**
+touched — the two scripts are fully independent and both idempotent
+(safe to re-run; each checks for its own gateway row by name first).
+Run it with:
+```bash
+python -m scripts.bootstrap_litellm
+```
+
+**Tests:** `tests/test_litellm_mapping.py` (9 tests, mirrors
+`test_estimators_and_mapping.py`'s OpenRouter mapping tests in
+structure) — basic chat model maps correctly (provider/model/
+capabilities/price conversion), `mode="embedding"` and
+`mode="image_generation"` both raise `ValueError` (the direct equivalent
+of OpenRouter's modality-filter protection — the most important test
+here, same as the task called out), `sample_spec` is skipped, an
+implausible price derived from `MAX_REASONABLE_PRICE_PER_1M + 1` raises,
+`supports_function_calling=True`/absent correctly toggles `tool_use`,
+and `mode="completion"` (not just `"chat"`) is accepted. All 9 pass with
+no live infrastructure — pure-function tests against literal dicts.
+
+Full `pytest -v` after this session: 35 passed (26 from Session 2 +
+9 new), 0 skipped. `python3 -m py_compile` across every new/changed
+file: zero syntax errors.
