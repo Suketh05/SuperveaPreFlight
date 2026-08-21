@@ -608,3 +608,122 @@ call counter — asserts fetching 3 keys (2 present, 1 missing) returns
 the right dict keyed by the original unprefixed keys with `None` for the
 miss, and that `mget` was called exactly once; and asserts an empty key
 list makes zero calls.
+
+### RESOLVED BUG #4 — decision cache ignored inline per-request constraints
+
+**Symptom:** found during live testing after the caching/rollup work
+above. Two requests with the identical `tenant_id` + `model` +
+`policy_profile_id` but *different* inline `constraints` in the request
+body (e.g. one plain, one with `constraints: {"allowed_providers":
+["made-up-provider"]}`) could return the exact same cached decision —
+the second request's constraints were silently never evaluated if a
+cached entry from the first request was still within its 120s TTL. This
+isn't hypothetical: it's exactly the sequence in `MENTOR_GUIDE.md`'s
+Demo 1 (no constraints) followed immediately by Demo 2 (`allowed_providers:
+["made-up-provider"]}`) — running Demo 2 within 120s of Demo 1 against
+the pre-fix code could return Demo 1's cached `"decision": "route"`
+instead of the documented `"decision": "fallback_existing_route"` with
+`provider_not_allowed` rejections.
+
+**Root cause:** `PreflightEngine._decision_cache_key(profile)` only
+hashed `profile.tenant_id`, `profile.requested_model`, and
+`profile.policy_profile_id` — all pulled from `RequestProfile`
+(`schemas/internal_models.py`), which never carried the raw
+`PreflightRequest.constraints` in the first place (`_build_profile()`
+only spreads two constraint fields — `allowed_regions[0]` and
+`data_classification` — into `RequestProfile.region` /
+`.data_classification`; everything else, including `allowed_providers`,
+`allowed_models`, `max_cost_usd`, `max_latency_ms`,
+`required_capabilities`, was dropped entirely before the cache key was
+ever computed).
+
+**Fix applied:** rather than growing `RequestProfile` to carry the full
+constraints blob (which would mean keeping two representations of the
+same data in sync), `_decision_cache_key` now takes the raw
+`PreflightConstraints | None` straight from `request.constraints` as a
+second parameter, alongside `profile`. It hashes
+`json.dumps(constraints.model_dump(), sort_keys=True, default=str)` (or
+`json.dumps({})` when `constraints is None`) into the same `raw` string
+that already had tenant/model/policy_profile_id. `sort_keys=True` keeps
+the hash stable regardless of field insertion order. The call site in
+`decide()` changed from `self._decision_cache_key(profile)` to
+`self._decision_cache_key(profile, request.constraints)` — `request` was
+already in scope there, so this needed no new plumbing through `decide()`
+itself.
+
+**New candidate metadata (`schemas/api_models.py` +
+`services/preflight_engine.py` + `services/route_filter.py`):** found
+alongside the cache-key bug during the same live-testing pass —
+`CandidateRoute` entries in API responses showed `route_id`/cost/latency/
+status but never `provider`, `model`, or `capabilities`, making a
+30+-entry `candidates` list unreadable without a separate DB lookup to
+map `route_id` back to something human-legible. Added `provider: Optional[str]`,
+`model: Optional[str]`, and `capabilities: Optional[List[str]]` to
+`CandidateRoute` (all optional so nothing existing breaks), and populated
+them at both construction sites: the eligible-routes loop in
+`preflight_engine.py::decide()`, and the rejected-routes construction in
+`route_filter.py::hard_filter()` (via `route.get(...)`, since a rejected
+route's dict still has these fields from `load_candidate_routes`).
+
+**Tests:** `tests/test_decision_cache_key.py` is the load-bearing proof
+for this bug — it calls `_decision_cache_key` directly with the same
+`RequestProfile` but different `PreflightConstraints` (none vs.
+`allowed_providers=["made-up-provider"]`) and asserts the two resulting
+keys differ; also checks two different non-empty constraint sets differ
+from each other, identical constraints hash identically, and `None` is
+stable across repeated calls. This test would fail against the pre-fix
+single-argument `_decision_cache_key(profile)` — there was no way to
+feed it different constraints and get different output, since it never
+looked at constraints at all.
+
+**`MENTOR_GUIDE.md` Demo 2 needs no changes** — its curl example already
+sends distinct constraint bodies per demo; it was relying on correct
+behavior that the bug above was violating. With the fix, running Demo 1
+immediately followed by Demo 2 (or in either order, or repeated) now
+always evaluates each request's constraints independently, exactly as
+the doc already describes — no doc update needed, this was a bug in the
+engine, not a doc that oversold a broken feature.
+
+---
+
+## Session 2 complete
+
+Every file touched across this session's four passes (Redis caching →
+observation/intelligence rollup → Redis MGET batching + background job
+startup → decision-cache-key bug + candidate metadata), for anyone
+wanting the full diff summary without re-deriving it from git log:
+
+- `core/config.py` — `policy_cache_ttl_seconds`, `pricing_cache_ttl_seconds`
+- `core/redis_cache.py` — `get_json_many()` (MGET batching)
+- `persistence/queries.py` — cache-through `load_policy()`;
+  `record_observation`, `fetch_observation_aggregates`,
+  `upsert_route_intelligence`, `load_active_gateways` + their SQL
+- `workers/route_normalizer.py` — `RETURNING route_id`, `fetchval`,
+  optional `redis_cache` param, writes `route:pricing:<id>` on upsert
+- `workers/scheduler.py` — optional `redis_cache` threaded through both
+  sync functions
+- `workers/intelligence_rollup.py` — **new file**: `compute_route_health`,
+  `run_intelligence_rollup_once`/`_loop`
+- `services/preflight_engine.py` — cache-through policy lookup, pricing
+  cache read with Postgres fallback, batched MGET pricing/health lookups,
+  real `_estimate_confidence` from route_intelligence, fixed
+  `_decision_cache_key` to include inline constraints, populated new
+  `CandidateRoute` metadata fields
+- `services/route_filter.py` — populated new `CandidateRoute` metadata
+  fields on rejected routes
+- `schemas/api_models.py` — new `ObservationIn`; `CandidateRoute` gained
+  `provider`/`model`/`capabilities`
+- `api/router.py` — new `POST /api/v1/observations` endpoint
+- `api/lifespan.py` — starts + tracks + cancels the catalogue sync and
+  intelligence rollup background loops
+- `scripts/bootstrap_openrouter.py` — builds its own `RedisCache`,
+  independent of `lifespan.py`, to also warm the pricing cache
+- `integration_example.py` — illustrative commented call to
+  `POST /api/v1/observations` after route execution
+- New tests: `test_policy_cache.py`, `test_intelligence_rollup.py`,
+  `test_redis_cache_batching.py`, `test_decision_cache_key.py`
+
+Full `pytest -v` suite: 26 passed, 0 skipped, no live Postgres/Redis
+required for any of them (all are pure-function or fake-collaborator
+unit tests). `python3 -m py_compile` across all of `app/` and `scripts/`:
+zero syntax errors.

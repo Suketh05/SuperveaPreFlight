@@ -44,6 +44,9 @@ class CandidateRoute(BaseModel):
     estimated_latency_ms: int
     status: Literal["eligible", "selected", "rejected"]
     rejection_reason: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    capabilities: Optional[List[str]] = None
 
 
 class PreflightDecision(BaseModel):

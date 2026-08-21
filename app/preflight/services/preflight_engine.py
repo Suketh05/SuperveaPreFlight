@@ -12,9 +12,10 @@ fast, cheap, and reproducible.
 """
 
 import hashlib
+import json
 import uuid
 from time import perf_counter
-from typing import Literal
+from typing import Literal, Optional
 
 import asyncpg
 
@@ -53,7 +54,7 @@ class PreflightEngine:
         start = perf_counter()
         profile = self._build_profile(request)
 
-        cache_key = self._decision_cache_key(profile)
+        cache_key = self._decision_cache_key(profile, request.constraints)
         cached = await self.redis.get_json(cache_key)
         if cached:
             return PreflightDecision(**cached)
@@ -100,6 +101,9 @@ class PreflightEngine:
                 estimated_cost_usd=cost,
                 estimated_latency_ms=int(latency_ms),
                 status="eligible",
+                provider=route["provider"],
+                model=route["model"],
+                capabilities=route.get("capabilities"),
             )
             candidates.append(candidate)
             enriched.append((route, candidate))
@@ -159,8 +163,21 @@ class PreflightEngine:
             policy_profile_id=request.policy_profile_id,
         )
 
-    def _decision_cache_key(self, profile: RequestProfile) -> str:
-        raw = f"{profile.tenant_id}:{profile.requested_model}:{profile.policy_profile_id}"
+    def _decision_cache_key(
+        self, profile: RequestProfile, constraints: Optional[PreflightConstraints]
+    ) -> str:
+        # Inline per-request `constraints` (e.g. allowed_providers on an
+        # ad-hoc request) must be part of the key — two requests with the
+        # same tenant/model/policy_profile_id but different inline
+        # constraints are NOT the same decision, and must not share a
+        # cached result. sort_keys keeps the hash stable regardless of
+        # field insertion order.
+        constraints_dict = constraints.model_dump() if constraints is not None else {}
+        constraints_json = json.dumps(constraints_dict, sort_keys=True, default=str)
+        raw = (
+            f"{profile.tenant_id}:{profile.requested_model}:"
+            f"{profile.policy_profile_id}:{constraints_json}"
+        )
         profile_hash = hashlib.sha256(raw.encode()).hexdigest()[:16]
         return f"preflight:decision:{profile.tenant_id}:{profile_hash}"
 

@@ -37,6 +37,9 @@ class RouteFilter:
                         estimated_latency_ms=0,
                         status="rejected",
                         rejection_reason=rejection_reason,
+                        provider=route.get("provider"),
+                        model=route.get("model"),
+                        capabilities=route.get("capabilities"),
                     )
                 )
                 continue
