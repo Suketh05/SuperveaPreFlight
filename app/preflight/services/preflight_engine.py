@@ -1,0 +1,190 @@
+"""The core deterministic decision engine.
+
+Priority order (lexicographic, per the blueprint):
+  1. Eliminate invalid routes
+  2. Eliminate unhealthy or stale routes
+  3. Meet customer latency/cost constraints
+  4. Select lowest-cost route
+  5. Use latency/reliability as tie-breaker
+
+No LLM calls happen anywhere in this file — the decision must stay
+fast, cheap, and reproducible.
+"""
+
+import hashlib
+import uuid
+from time import perf_counter
+from typing import Literal
+
+import asyncpg
+
+from app.preflight.core.redis_cache import RedisCache
+from app.preflight.persistence import queries
+from app.preflight.schemas.api_models import (
+    CandidateRoute,
+    Message,
+    PreflightConstraints,
+    PreflightDecision,
+    PreflightRequest,
+)
+from app.preflight.schemas.internal_models import RequestProfile
+from app.preflight.services.estimators import CostEstimator, TokenEstimator
+from app.preflight.services.route_filter import RouteFilter
+
+
+class PreflightEngine:
+    def __init__(
+        self,
+        db: asyncpg.Connection,
+        redis_cache: RedisCache,
+        token_estimator: TokenEstimator,
+        cost_estimator: CostEstimator,
+        route_filter: RouteFilter,
+    ):
+        self.db = db
+        self.redis = redis_cache
+        self.token_estimator = token_estimator
+        self.cost_estimator = cost_estimator
+        self.route_filter = route_filter
+
+    async def decide(
+        self, request: PreflightRequest, mode: Literal["observe", "optimize"]
+    ) -> PreflightDecision:
+        start = perf_counter()
+        profile = self._build_profile(request)
+
+        cache_key = self._decision_cache_key(profile)
+        cached = await self.redis.get_json(cache_key)
+        if cached:
+            return PreflightDecision(**cached)
+
+        policy = await queries.load_policy(self.db, profile.policy_profile_id)
+        candidate_routes = await queries.load_candidate_routes(self.db, profile)
+
+        eligible, rejected = await self.route_filter.hard_filter(profile, candidate_routes, policy)
+
+        if not eligible:
+            return await self._no_route_decision(profile, mode, rejected, start)
+
+        input_tokens, output_tokens = self.token_estimator.estimate_tokens(request.messages)
+
+        candidates: list[CandidateRoute] = rejected.copy()
+        enriched: list[tuple[dict, CandidateRoute]] = []
+
+        for route in eligible:
+            cost = self.cost_estimator.estimate_cost_usd(route, input_tokens, output_tokens)
+            health = await self.redis.get_json(f"route:health:{route['route_id']}") or {}
+            latency_ms = health.get("latency_p95_ms") or route.get("advertised_latency_p95") or 1000
+
+            candidate = CandidateRoute(
+                route_id=str(route["route_id"]),
+                estimated_cost_usd=cost,
+                estimated_latency_ms=int(latency_ms),
+                status="eligible",
+            )
+            candidates.append(candidate)
+            enriched.append((route, candidate))
+
+        constrained = [
+            (route, cand) for route, cand in enriched if self._within_constraints(cand, policy)
+        ]
+        if not constrained:
+            # No route meets soft constraints (cost/latency caps) -> relax
+            # rather than fail outright; still policy/health-compliant.
+            constrained = enriched
+
+        constrained.sort(key=lambda rc: (rc[1].estimated_cost_usd, rc[1].estimated_latency_ms))
+        selected_route, selected_candidate = constrained[0]
+
+        decision_latency_ms = (perf_counter() - start) * 1000
+        decision = PreflightDecision(
+            decision="route",
+            decision_id=str(uuid.uuid4()),
+            route_id=str(selected_route["route_id"]),
+            gateway_id=str(selected_route["gateway_id"]),
+            provider=selected_route["provider"],
+            model=selected_route["model"],
+            estimated_cost_usd=selected_candidate.estimated_cost_usd,
+            estimated_latency_ms=selected_candidate.estimated_latency_ms,
+            confidence=self._estimate_confidence(selected_route),
+            candidates=candidates,
+            reason=(
+                "Lowest estimated cost among healthy, policy-compliant routes "
+                "meeting latency and residency requirements."
+            ),
+            decision_latency_ms=decision_latency_ms,
+        )
+
+        await self._persist(profile, mode, decision)
+        await self.redis.set_json(cache_key, decision.model_dump(), ttl_seconds=120)
+        return decision
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_profile(self, request: PreflightRequest) -> RequestProfile:
+        input_tokens, output_tokens = self.token_estimator.estimate_tokens(request.messages)
+        constraints = request.constraints or PreflightConstraints()
+        return RequestProfile(
+            operation="chat",
+            requested_model=request.model,
+            estimated_input_tokens=input_tokens,
+            estimated_output_tokens=output_tokens,
+            capability="general_chat",
+            region=(constraints.allowed_regions or ["global"])[0],
+            data_classification=constraints.data_classification or "internal",
+            tenant_id=request.tenant_id,
+            policy_profile_id=request.policy_profile_id,
+        )
+
+    def _decision_cache_key(self, profile: RequestProfile) -> str:
+        raw = f"{profile.tenant_id}:{profile.requested_model}:{profile.policy_profile_id}"
+        profile_hash = hashlib.sha256(raw.encode()).hexdigest()[:16]
+        return f"preflight:decision:{profile.tenant_id}:{profile_hash}"
+
+    def _within_constraints(self, candidate: CandidateRoute, policy: PreflightConstraints) -> bool:
+        if policy.max_cost_usd is not None and candidate.estimated_cost_usd > policy.max_cost_usd:
+            return False
+        if policy.max_latency_ms is not None and candidate.estimated_latency_ms > policy.max_latency_ms:
+            return False
+        return True
+
+    def _estimate_confidence(self, route: dict) -> float:
+        # MVP: flat confidence for fresh, healthy routes. Refine using
+        # route_intelligence (success rates, observation volume) later.
+        return 0.8 if route.get("data_freshness") == "fresh" else 0.4
+
+    async def _no_route_decision(
+        self,
+        profile: RequestProfile,
+        mode: str,
+        rejected: list[CandidateRoute],
+        start: float,
+    ) -> PreflightDecision:
+        decision_latency_ms = (perf_counter() - start) * 1000
+        decision = PreflightDecision(
+            decision="fallback_existing_route",
+            decision_id=str(uuid.uuid4()),
+            candidates=rejected,
+            reason="No eligible routes found; falling back to existing route.",
+            decision_latency_ms=decision_latency_ms,
+        )
+        await self._persist(profile, mode, decision)
+        return decision
+
+    async def _persist(self, profile: RequestProfile, mode: str, decision: PreflightDecision) -> None:
+        request_hash = hashlib.sha256(
+            f"{profile.tenant_id}:{profile.requested_model}".encode()
+        ).hexdigest()
+        await queries.persist_decision(
+            self.db,
+            tenant_id=profile.tenant_id,
+            request_hash=request_hash,
+            mode=mode,
+            selected_route_id=decision.route_id,
+            decision_type=decision.decision,
+            candidates=decision.candidates,
+            reason=decision.reason,
+            decision_latency_ms=decision.decision_latency_ms,
+        )

@@ -1,0 +1,6 @@
+# Never commit or zip these
+.env
+pfvenv/
+__pycache__/
+*.pyc
+.pytest_cache/
