@@ -56,6 +56,7 @@ class PreflightDecision(BaseModel):
     gateway_id: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
+    capabilities: Optional[List[str]] = None
     estimated_cost_usd: Optional[float] = None
     estimated_latency_ms: Optional[int] = None
     confidence: float = 0.0

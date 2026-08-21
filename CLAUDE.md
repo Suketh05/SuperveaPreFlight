@@ -989,3 +989,43 @@ Full `pytest -v` after this session: 45 passed (35 from Session 3 + 9 new
 `test_policy_merge.py` + 1 new `test_inline_constraints_integration.py`),
 0 skipped, no live Postgres/Redis required. `python3 -m py_compile`
 across every new/changed file: zero syntax errors.
+
+## Session 5 — top-level `capabilities` on PreflightDecision
+
+`CandidateRoute.capabilities` (added in Session 4 alongside `provider`/
+`model`) only existed inside the `candidates` array — reading the
+*winning* route's capabilities required cross-referencing
+`decision.route_id` against `decision.candidates` to find the matching
+entry. Added `capabilities: Optional[List[str]] = None` directly to
+`PreflightDecision` (`schemas/api_models.py`), right next to the existing
+top-level `model` field. **This is not a blueprint/spec requirement** —
+it's a pure readability improvement layered on top of the Session 4 work,
+mirroring the same `provider`/`model` pattern that already existed at the
+top level for the same reason.
+
+`services/preflight_engine.py::decide()` now sets
+`capabilities=selected_route.get("capabilities")` in the successful-route
+`PreflightDecision(...)` construction, alongside the existing
+`provider=selected_route["provider"]` / `model=selected_route["model"]`.
+`_no_route_decision()` now explicitly sets `capabilities=None` (would
+default to `None` anyway, but explicit here for the same reason
+`route_id`/`provider`/`model` are conceptually absent on that path — makes
+the intent readable at the call site). The `candidates` list construction
+itself (`route_filter.py` and the eligible-routes loop in the engine) was
+untouched — that part already populated per-candidate `capabilities`
+correctly in Session 4; this session only mirrors that value up to the
+top level for the winning route.
+
+**Test:** `tests/test_top_level_capabilities.py` — two fake routes with
+different capability lists (`["chat", "tool_use"]` vs. `["chat",
+"long_context"]`), asserts the cheaper route wins, `decision.capabilities`
+is not `None`, and it equals the `capabilities` of whichever candidate in
+`decision.candidates` has the matching `route_id` — proving the top-level
+field and the per-candidate entry actually agree, not just that the field
+exists. A second test asserts the `fallback_existing_route` path has
+`decision.capabilities is None`.
+
+Full `pytest -v` after this session: 47 passed (45 from Session 4 + 2
+new in `test_top_level_capabilities.py`), 0 skipped, no live
+Postgres/Redis required. `python3 -m py_compile` on both changed files:
+zero syntax errors.

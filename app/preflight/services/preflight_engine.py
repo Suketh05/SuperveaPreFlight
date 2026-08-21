@@ -135,6 +135,7 @@ class PreflightEngine:
             gateway_id=str(selected_route["gateway_id"]),
             provider=selected_route["provider"],
             model=selected_route["model"],
+            capabilities=selected_route.get("capabilities"),
             estimated_cost_usd=selected_candidate.estimated_cost_usd,
             estimated_latency_ms=selected_candidate.estimated_latency_ms,
             confidence=self._estimate_confidence(
@@ -215,6 +216,7 @@ class PreflightEngine:
         decision = PreflightDecision(
             decision="fallback_existing_route",
             decision_id=str(uuid.uuid4()),
+            capabilities=None,
             candidates=rejected,
             reason="No eligible routes found; falling back to existing route.",
             decision_latency_ms=decision_latency_ms,
