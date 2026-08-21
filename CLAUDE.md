@@ -860,3 +860,132 @@ no live infrastructure — pure-function tests against literal dicts.
 Full `pytest -v` after this session: 35 passed (26 from Session 2 +
 9 new), 0 skipped. `python3 -m py_compile` across every new/changed
 file: zero syntax errors.
+
+## Session 4 — RESOLVED BUG #5 — inline request.constraints never reached hard_filter()
+
+**Symptom:** found during live testing, and looked at first glance like a
+recurrence of RESOLVED BUG #4 (the decision-cache-key bug) — a request
+sent with `constraints: {"allowed_providers": ["made-up-provider"]}` and
+no `policy_profile_id` came back `"decision": "route"` with every
+candidate `"status": "eligible"`, when it should have fallen back with
+every candidate rejected `provider_not_allowed`. The live curl that first
+exposed it:
+
+```bash
+curl -X POST http://localhost:8001/api/v1/preflight \
+  -H "X-Supervea-Tenant: demo-tenant" -H "Content-Type: application/json" \
+  -d '{"model": "auto", "messages": [{"role": "user", "content": "hello"}],
+       "constraints": {"allowed_providers": ["made-up-provider"]}}'
+```
+Expected after this fix: `"decision": "fallback_existing_route"`, every
+candidate's `rejection_reason` == `"provider_not_allowed"`. Re-run this
+exact command to re-verify the fix in a future session.
+
+**Why it looked like the cache-key bug but wasn't:** BUG #4's fix already
+made `_decision_cache_key` hash `request.constraints`, so a fresh
+(uncached) request should never have been able to silently reuse another
+request's decision — and indeed it wasn't a caching artifact. Re-running
+the curl above repeatedly, well past the 120s cache TTL, reproduced the
+same wrong `"decision": "route"` result every time. That ruled out the
+cache and pointed at the filtering path itself.
+
+**Root cause:** `request.constraints` never reached `route_filter.hard_filter()`
+at all — regardless of caching. Tracing `decide()` step by step:
+`_build_profile(request)` builds a `RequestProfile`
+(`schemas/internal_models.py`), and `RequestProfile` has no field for the
+constraints object itself — it only has `policy_profile_id` (a string
+reference) and, separately, `region` / `data_classification`, which
+`_build_profile()` populates by reading exactly two fields off
+`request.constraints` (`allowed_regions[0]` and `data_classification`).
+Every other field on `PreflightConstraints` — `allowed_providers`,
+`allowed_models`, `max_cost_usd`, `max_latency_ms`,
+`required_capabilities` — was read from `request.constraints` **nowhere**
+in the engine. `decide()` then computed `policy = await
+queries.load_policy(self.db, profile.policy_profile_id, self.redis)`,
+which only ever looks up a *stored* policy_profile row (or returns an
+empty `PreflightConstraints()` if `policy_profile_id` is `None`, which it
+was in the reported curl — no stored policy was even configured), and
+passed that `policy` straight into `hard_filter()`. Inline constraints on
+the request body were silently discarded before hard_filter ever saw
+them — a "no policy" request effectively had zero policy enforcement,
+inline constraints or not.
+
+**Fix applied:** added `services/policy_merge.py::merge_constraints(base,
+override)`, a pure function (no I/O, so no engine/DB/Redis needed to unit
+test it) that combines a stored policy (`base`) with inline request
+constraints (`override`) into one `PreflightConstraints`, "most
+restrictive of each field wins" — the result can never be looser than
+either input alone:
+- `allowed_providers` / `allowed_models` / `allowed_regions` /
+  `required_capabilities` (all `Optional[List[str]]`): if both sides are
+  set, the result is the **set intersection** (deduped list — a provider
+  must be allowed by *both* sides to remain allowed); if only one side is
+  set, use it unchanged; if neither, `None` ("unrestricted", matching
+  `hard_filter`'s existing `if policy.allowed_providers and ...` falsy-`None`
+  check). An intersection that comes out empty (e.g. disjoint lists) is
+  intentional and correct — it means "no provider satisfies both", which
+  `hard_filter` then correctly turns into `no_route_found` /
+  `fallback_existing_route` downstream, not a crash.
+- `max_cost_usd` / `max_latency_ms` (`Optional[float]`/`Optional[int]`):
+  if both set, `min(base, override)` (the tighter cap wins); if only one
+  set, use it; if neither, `None`.
+- `data_classification` (defaults to `"internal"`, not `None`): explicit
+  ordering `public < internal < sensitive < restricted`; result is
+  whichever side is more restrictive, regardless of whether that's `base`
+  or `override` — e.g. a stored policy of `"sensitive"` stays
+  `"sensitive"` even if the inline request only asks for `"public"`, and
+  an inline request asking for `"restricted"` tightens a stored
+  `"internal"` policy up to `"restricted"`.
+
+`services/preflight_engine.py::decide()` now does, immediately after the
+existing `load_policy` call: `policy = merge_constraints(policy,
+request.constraints)` — before `policy` is used for `hard_filter()` or
+the `max_cost_usd`/`max_latency_ms` soft-constraint check
+(`_within_constraints`) later in the same method, so *both* filtering
+stages see the merged, correctly-restrictive policy, not just the stored
+one. `request` (the full `PreflightRequest`) was already in scope at that
+point in `decide()` — no new plumbing needed, same as BUG #4's fix.
+
+**Decision-cache key needed no change** — confirmed, not assumed: BUG
+#4's fix already hashes the raw `request.constraints` object directly
+into `_decision_cache_key`, independent of how `policy` itself gets
+computed downstream, so it already distinguishes any two requests with
+different inline constraints regardless of this bug or its fix.
+
+**`RequestProfile` was deliberately NOT expanded to carry the full
+constraints blob** — same reasoning BUG #4's fix used for the cache key:
+keeping the raw `PreflightConstraints` and its `RequestProfile`
+projection in sync as two representations of the same data is a future
+bug waiting to happen. `merge_constraints` instead takes the raw
+`request.constraints` straight from the `PreflightRequest` still in scope
+inside `decide()`.
+
+**Tests:**
+- `tests/test_policy_merge.py` — pure unit tests of `merge_constraints`
+  directly (no engine, no DB/Redis): disjoint `allowed_providers` produce
+  an empty (not crashing) intersection; overlapping lists intersect
+  correctly; only-override-set passes the override value through
+  unchanged; `max_cost_usd` takes whichever side is smaller in both
+  directions (override-smaller and base-smaller); `data_classification`
+  picks the more restrictive side regardless of which side (base or
+  override) it came from; `override=None` returns `base` unchanged
+  (byte-for-byte backward compatible with the pre-fix "no inline
+  constraints" case).
+- `tests/test_inline_constraints_integration.py` — the load-bearing proof
+  this bug is actually fixed, at the `PreflightEngine.decide()` level,
+  not just at the pure-function level: builds a `PreflightRequest` with
+  `constraints=PreflightConstraints(allowed_providers=["made-up-provider"])`
+  and no `policy_profile_id`, runs it through `decide()` against two fake
+  healthy/fresh routes (`provider="openai"`, `provider="anthropic"`) using
+  in-memory `FakeDB`/`FakeRedisCache` stand-ins (same pattern as
+  `test_policy_cache.py` — no live Postgres/Redis), and asserts
+  `decision.decision == "fallback_existing_route"` with **every**
+  candidate's `rejection_reason == "provider_not_allowed"`. This test
+  fails against the pre-fix code (it returns `"decision": "route"` with
+  both candidates `"status": "eligible"`) and passes after the fix — it's
+  the direct regression test for the reported curl.
+
+Full `pytest -v` after this session: 45 passed (35 from Session 3 + 9 new
+`test_policy_merge.py` + 1 new `test_inline_constraints_integration.py`),
+0 skipped, no live Postgres/Redis required. `python3 -m py_compile`
+across every new/changed file: zero syntax errors.

@@ -30,6 +30,7 @@ from app.preflight.schemas.api_models import (
 )
 from app.preflight.schemas.internal_models import RequestProfile
 from app.preflight.services.estimators import CostEstimator, TokenEstimator
+from app.preflight.services.policy_merge import merge_constraints
 from app.preflight.services.route_filter import RouteFilter
 
 
@@ -60,6 +61,13 @@ class PreflightEngine:
             return PreflightDecision(**cached)
 
         policy = await queries.load_policy(self.db, profile.policy_profile_id, self.redis)
+        # Inline request.constraints never reached RequestProfile (only
+        # region/data_classification were extracted into it) and so never
+        # reached hard_filter() — a stored policy_profile_id was honored,
+        # but ad-hoc constraints on the request itself were silently
+        # dropped. Merge them in here, most-restrictive-of-each-field-wins,
+        # before the merged policy is ever used for filtering.
+        policy = merge_constraints(policy, request.constraints)
         candidate_routes = await queries.load_candidate_routes(self.db, profile)
 
         eligible, rejected = await self.route_filter.hard_filter(profile, candidate_routes, policy)
